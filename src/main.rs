@@ -42,7 +42,7 @@ async fn main() -> Result<(), Error> {
     dotenv()?;
     let token = env::var("DISCORD_TOKEN")?;
     let chan = env::var("DISCORD_CHANNEL")?.parse::<u64>()?;
-    let api = env::var("MC_API_BASE")?; // http://host:8080
+    let api = env::var("MC_API_BASE")?; // 例: http://host:8080
     let reqwest_client = Client::new();
 
     let intents = serenity::GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
@@ -85,21 +85,21 @@ async fn handle_events(
     event: &serenity::FullEvent,
     data: Data,
 ) -> Result<(), Error> {
+    // 人間の発言 → say xxx: msg を /chats へ
     if let serenity::FullEvent::Message {
         new_message: message,
     } = event
     {
-        // 人間の発言 → say xxx: msg を /chats へ
         if message.channel_id == data.chan_id && !message.author.bot {
             println!("received message: {}", message.content);
-            let formatted = format!("say {}: {}", message.author.name, message.content);
+            let formatted = format!("/say {}: {}\n", message.author.name, message.content);
             data.send_ws.send(formatted).await?;
         }
     }
     Ok(())
 }
 
-/// 初回 listener 呼び出しで WebSocket タスクを開始
+/// 初回 listener 呼び出しで WebSocket タスクを開始 ----------------------------
 async fn init_ws(api: &str, chan_id: ChannelId, ctx: serenity::Context) -> mpsc::Sender<String> {
     let (tx, mut rx) = mpsc::channel::<String>(32);
     let ws_url = api.replace("http", "ws") + "/chats";
@@ -115,22 +115,34 @@ async fn init_ws(api: &str, chan_id: ChannelId, ctx: serenity::Context) -> mpsc:
         };
         let (mut write, mut read) = ws_stream.split();
 
-        // Discord→MC
+        // Discord → Minecraft -------------------------------------------------
         spawn(async move {
             while let Some(msg) = rx.recv().await {
                 let _ = write.send(Message::Text(msg.into())).await;
             }
         });
 
-        // MC→Discord
+        // --- 受信側判定用正規表現 -------------------------------------------
         let re_join = Regex::new(r#"joined the game|left the game"#).unwrap();
         let re_adv = Regex::new(r#"has made the advancement"#).unwrap();
+        // 例: [08:37:28] ... <User> Hello!
+        let re_chat = Regex::new(r#": <([^>]+)> (.+)$"#).unwrap();
         let ts = Regex::new(r#"^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]"#).unwrap();
 
+        // Minecraft → Discord -------------------------------------------------
         while let Some(Ok(msg)) = read.next().await {
             if let Message::Text(t) = msg {
-                if !(re_join.is_match(&t) || re_adv.is_match(&t)) {
+                // （1）チャット行
+                if let Some(cap) = re_chat.captures(&t) {
+                    let user = &cap[1];
+                    let body = &cap[2];
+                    let _ = chan_id.say(&ctx.http, format!("{user}: {body}")).await;
                     continue;
+                }
+
+                // （2）参加/退出・実績行
+                if !(re_join.is_match(&t) || re_adv.is_match(&t)) {
+                    continue; // それ以外は無視
                 }
                 let start = ts.find(&t).map(|m| m.start()).unwrap_or(0);
                 let clean = &t[start..];
@@ -138,5 +150,6 @@ async fn init_ws(api: &str, chan_id: ChannelId, ctx: serenity::Context) -> mpsc:
             }
         }
     });
+
     tx
 }
