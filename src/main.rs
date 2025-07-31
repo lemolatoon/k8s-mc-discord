@@ -39,7 +39,9 @@ async fn list(ctx: Context<'_>) -> Result<(), Error> {
 /// ------ エントリポイント ----------------------------------------------------
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    dotenv()?;
+    if std::fs::exists(".env")? {
+        dotenv()?;
+    }
     let token = env::var("DISCORD_TOKEN")?;
     let chan = env::var("DISCORD_CHANNEL")?.parse::<u64>()?;
     let api = env::var("MC_API_BASE")?; // 例: http://host:8080
