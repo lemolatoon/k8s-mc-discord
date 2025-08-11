@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, time::Duration};
 
 use dotenvy::dotenv;
 use poise::{
@@ -102,54 +102,93 @@ async fn handle_events(
 }
 
 /// 初回 listener 呼び出しで WebSocket タスクを開始 ----------------------------
-async fn init_ws(api: &str, chan_id: ChannelId, ctx: serenity::Context) -> mpsc::Sender<String> {
+pub async fn init_ws(
+    api: &str,
+    chan_id: ChannelId,
+    ctx: serenity::Context,
+) -> mpsc::Sender<String> {
     let (tx, mut rx) = mpsc::channel::<String>(32);
     let ws_url = api.replace("http", "ws") + "/chats";
 
     spawn(async move {
-        println!("Connecting to WebSocket: {}", ws_url);
-        let (ws_stream, _) = match connect_async(&ws_url).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("WS connect error: {e}");
-                return;
-            }
-        };
-        let (mut write, mut read) = ws_stream.split();
-
-        // Discord → Minecraft -------------------------------------------------
-        spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                let _ = write.send(Message::Text(msg.into())).await;
-            }
-        });
-
-        // --- 受信側判定用正規表現 -------------------------------------------
+        // --- 受信側判定用正規表現 (ループ外で一度だけコンパイル) ---
         let re_join = Regex::new(r#"joined the game|left the game"#).unwrap();
         let re_adv = Regex::new(r#"has made the advancement"#).unwrap();
-        // 例: [08:37:28] ... <User> Hello!
+        // 例: [08:37:28] [Server thread/INFO]: <User> Hello!
         let re_chat = Regex::new(r#": <([^>]+)> (.+)$"#).unwrap();
         let ts = Regex::new(r#"^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]"#).unwrap();
 
-        // Minecraft → Discord -------------------------------------------------
-        while let Some(Ok(msg)) = read.next().await {
-            if let Message::Text(t) = msg {
-                // （1）チャット行
-                if let Some(cap) = re_chat.captures(&t) {
-                    let user = &cap[1];
-                    let body = &cap[2];
-                    let _ = chan_id.say(&ctx.http, format!("{user}: {body}")).await;
-                    continue;
+        // ------------------------------------------------------------------
+        //  再接続ループ
+        // ------------------------------------------------------------------
+        'reconnect: loop {
+            println!("Connecting to WebSocket: {}", ws_url);
+            // WebSocketサーバーへ接続
+            let ws_stream = match connect_async(&ws_url).await {
+                Ok((stream, _)) => {
+                    println!("WebSocket connected successfully.");
+                    stream
                 }
+                Err(e) => {
+                    eprintln!("WS connect error: {}. Retrying in 5 seconds...", e);
+                    // 接続失敗時は5秒待ってリトライ
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue 'reconnect;
+                }
+            };
 
-                // （2）参加/退出・実績行
-                if !(re_join.is_match(&t) || re_adv.is_match(&t)) {
-                    continue; // それ以外は無視
+            let (mut write, mut read) = ws_stream.split();
+
+            // ------------------------------------------------------------------
+            //  送受信ループ
+            // ------------------------------------------------------------------
+            loop {
+                tokio::select! {
+                    // Discord -> Minecraft
+                    // mpscチャネルからメッセージを受信したら、WebSocketに書き込む
+                    Some(msg_to_send) = rx.recv() => {
+                        if write.send(Message::Text(msg_to_send.into())).await.is_err() {
+                            eprintln!("WS send error. Connection may be closed.");
+                            // 書き込みに失敗したら接続が切れている可能性が高いので、
+                            // 内側ループを抜けて再接続シーケンスに入る
+                            break;
+                        }
+                    },
+
+                    // Minecraft -> Discord
+                    // WebSocketからメッセージを受信したら、内容を解析してDiscordに送信
+                    Some(Ok(msg)) = read.next() => {
+                        if let Message::Text(t) = msg {
+                            // （1）チャット行
+                            if let Some(cap) = re_chat.captures(&t) {
+                                let user = &cap[1];
+                                let body = &cap[2];
+                                let _ = chan_id.say(&ctx.http, format!("{user}: {body}")).await;
+                                continue;
+                            }
+
+                            // （2）参加/退出・実績行
+                            if re_join.is_match(&t) || re_adv.is_match(&t) {
+                                let start = ts.find(&t).map(|m| m.start()).unwrap_or(0);
+                                let clean = &t[start..];
+                                let _ = chan_id.say(&ctx.http, clean).await;
+                            }
+                            // それ以外は無視
+                        }
+                    },
+                    // select! のどちらの分岐も実行されなかった場合、
+                    // readストリームが終了した（＝接続が切れた）ことを意味する
+                    else => {
+                        eprintln!("WS connection closed.");
+                        break;
+                    }
                 }
-                let start = ts.find(&t).map(|m| m.start()).unwrap_or(0);
-                let clean = &t[start..];
-                let _ = chan_id.say(&ctx.http, clean).await;
             }
+
+            // 内側ループを抜けたら、接続が切れたことを意味する
+            // 5秒待ってから再接続を試みる
+            println!("Disconnected from WebSocket. Reconnecting in 5 seconds...");
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 
