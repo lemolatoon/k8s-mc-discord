@@ -36,6 +36,29 @@ async fn list(ctx: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Kill the Minecraft pod via the API.
+#[poise::command(slash_command)]
+async fn kill(ctx: Context<'_>) -> Result<(), Error> {
+    let url = format!("{}/kill", ctx.data().api);
+    let resp = ctx.data().http.post(&url).send().await?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_else(|_| "".into());
+
+    let msg = if status.is_success() {
+        if txt.is_empty() {
+            "Killed Minecraft pod (API returned no body)".to_string()
+        } else {
+            txt
+        }
+    } else {
+        format!("Kill request failed: {} {}", status, txt)
+    };
+
+    println!("Kill response: {}", msg);
+    ctx.say(msg).await?;
+    Ok(())
+}
+
 /// ------ エントリポイント ----------------------------------------------------
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -65,7 +88,7 @@ async fn main() -> Result<(), Error> {
             })
         })
         .options(FrameworkOptions {
-            commands: vec![list()],
+            commands: vec![list(), kill()],
             event_handler: |ctx, event, _framework, data| {
                 Box::pin(handle_events(ctx, event, data.clone()))
             },
