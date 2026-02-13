@@ -114,12 +114,12 @@ async fn handle_events(
     if let serenity::FullEvent::Message {
         new_message: message,
     } = event
+        && message.channel_id == data.chan_id
+        && !message.author.bot
     {
-        if message.channel_id == data.chan_id && !message.author.bot {
-            println!("received message: {}", message.content);
-            let formatted = format!("/say {}: {}\n", message.author.name, message.content);
-            data.send_ws.send(formatted).await?;
-        }
+        println!("received message: {}", message.content);
+        let formatted = format!("/say {}: {}\n", message.author.name, message.content);
+        data.send_ws.send(formatted).await?;
     }
     Ok(())
 }
@@ -137,6 +137,7 @@ pub async fn init_ws(
         // --- 受信側判定用正規表現 (ループ外で一度だけコンパイル) ---
         let re_join = Regex::new(r#"joined the game|left the game"#).unwrap();
         let re_adv = Regex::new(r#"has made the advancement"#).unwrap();
+        let re_backup = Regex::new(r#"SimpleBackups/INFO].*Backup (started|completed)"#).unwrap();
         // 例: [08:37:28] [Server thread/INFO]: <User> Hello!
         let re_chat = Regex::new(r#": <([^>]+)> (.+)$"#).unwrap();
         let ts = Regex::new(r#"^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]"#).unwrap();
@@ -190,8 +191,8 @@ pub async fn init_ws(
                                 continue;
                             }
 
-                            // （2）参加/退出・実績行
-                            if re_join.is_match(&t) || re_adv.is_match(&t) {
+                            // （2）参加/退出・実績・バックアップ行
+                            if re_join.is_match(&t) || re_adv.is_match(&t) || re_backup.is_match(&t) {
                                 let start = ts.find(&t).map(|m| m.start()).unwrap_or(0);
                                 let clean = &t[start..];
                                 let _ = chan_id.say(&ctx.http, clean).await;
